@@ -49,6 +49,7 @@ test_dataset = FruitImageDataset(
 )
 
 class_mapping = train_dataset.get_class_mapping()
+
 num_classes = len(class_mapping)
 batch_size = 32
 train_loader = DataLoader(
@@ -65,7 +66,13 @@ test_loader = DataLoader(
     num_workers=0   
 )
 
+resume = False
+
+#TODO: change to args.resume, set hyper parameter for model structure
+
 model = ResNet(3, num_classes=num_classes).to(device)
+if resume:
+    model.load_state_dict(torch.load("./checkpoints/model.pth", weights_only=True))
 
 loss_fn = nn.CrossEntropyLoss()
 optimizer = torch.optim.SGD(model.parameters(), lr = 1e-3)
@@ -88,7 +95,50 @@ def train(dataloader, batch_size, model, loss_fn, optimizer):
             loss, current = loss.item(), (batch + 1) * len(X)
             print(f"\ntraining loss: {loss:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
             
+"""
+side notes:
+Output from model `num_classes` entries tensor is called logits (not yet normalized)
+However, no softmax function is needed during training.
+In `nn.CrossEntropyLoss()`, several steps are implemented
+1. Logits -> softmax -> probability distribution
+2. cross entropy calculation
+"""      
+
+def evaluate(dataloader, batch_size, model):
+    model.eval()
+    correct = 0
+    total = 0
+    size = len(dataloader.dataset)
+    
+    with torch.no_grad():
+        for inputs, labels in tqdm(dataloader, total = size//batch_size ,desc="Testing"):
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            pred = model(inputs)
+            _, predicted = torch.max(pred, 1)
+            
+            correct += (predicted == labels).sum().item()
+            total += labels.size(0)
+    accuracy = correct/total
+    return accuracy
+            
 epochs = 3
 for t in range(epochs):
     print(f"Epoch {t+1}\n-------------------------------")
     train(train_loader,batch_size, model, loss_fn, optimizer)
+    accuracy = evaluate(test_loader, batch_size, model)
+    print(f"Epoch {t+1} ends, evaluation accuracy on test set is: {accuracy:2f}")
+
+torch.save(model.state_dict(), "./checkpoints/model.pth")
+print("Saved PyTorch Model State to model.pth")
+
+model.eval()
+X, y = test_dataset[0][0], test_dataset[0][1]
+with torch.no_grad():
+    X = X.to(device)
+    pred = model(X)
+    predicted, actual = class_mapping[torch.argmax(pred[0])], class_mapping[y]
+    print(f'Predicted: "{predicted}", Actual: "{actual}"')
+    
+    
+
