@@ -140,5 +140,3 @@ with torch.no_grad():
     predicted, actual = class_mapping[torch.argmax(pred[0])], class_mapping[y]
     print(f'Predicted: "{predicted}", Actual: "{actual}"')
     
-    
-
