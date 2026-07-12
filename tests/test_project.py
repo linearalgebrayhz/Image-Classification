@@ -5,8 +5,9 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from demo import load_predictor
 from models import build_model
-from trainer import parse_args
+from trainer import model_kwargs, parse_args, save_checkpoint, validate_args
 from utils.data_processing import FruitImageDataset
 
 
@@ -65,6 +66,57 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(args.data_root, Path("/tmp/fruits"))
         self.assertEqual(args.model, "vit")
         self.assertEqual(args.epochs, 2)
+
+    def test_invalid_vit_dimensions_are_rejected(self):
+        args = parse_args(
+            [
+                "--data-root",
+                "/tmp/fruits",
+                "--model",
+                "vit",
+                "--model-dim",
+                "30",
+                "--heads",
+                "8",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "divisible by heads"):
+            validate_args(args)
+
+
+class CheckpointTests(unittest.TestCase):
+    def test_checkpoint_loads_in_demo_predictor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "model.pt"
+            args = parse_args(
+                [
+                    "--data-root",
+                    directory,
+                    "--image-size",
+                    "32",
+                    "--depth",
+                    "1",
+                    "--resnet-channels",
+                    "8",
+                    "--checkpoint",
+                    str(checkpoint_path),
+                ]
+            )
+            model = build_model("resnet", num_classes=2, **model_kwargs(args))
+            optimizer = torch.optim.AdamW(model.parameters())
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                epoch=1,
+                args=args,
+                class_to_idx={"Apple": 0, "Banana": 1},
+            )
+
+            predictor = load_predictor(checkpoint_path, torch.device("cpu"))
+            prediction = predictor(Image.new("RGB", (32, 32), "red"))
+
+            self.assertEqual(set(prediction), {"Apple", "Banana"})
 
 
 if __name__ == "__main__":

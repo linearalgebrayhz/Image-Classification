@@ -29,6 +29,7 @@ def parse_args(argv=None):
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--depth", type=int, default=4, help="blocks/layers in the selected model")
     parser.add_argument("--model-dim", type=int, default=192)
+    parser.add_argument("--resnet-channels", type=int, default=32)
     parser.add_argument("--heads", type=int, default=8, help="attention heads for ViT")
     parser.add_argument("--state-dim", type=int, default=16, help="state size for Mamba")
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/model.pt"))
@@ -75,7 +76,7 @@ def create_transforms(image_size):
 
 def model_kwargs(args):
     if args.model == "resnet":
-        return {"num_blocks": args.depth, "base_channels": args.model_dim}
+        return {"num_blocks": args.depth, "base_channels": args.resnet_channels}
     if args.model == "vit":
         return {
             "image_size": args.image_size,
@@ -92,6 +93,51 @@ def model_kwargs(args):
         "depth": args.depth,
         "state_dim": args.state_dim,
     }
+
+
+def validate_args(args):
+    positive = {
+        "epochs": args.epochs,
+        "batch-size": args.batch_size,
+        "depth": args.depth,
+        "image-size": args.image_size,
+        "patch-size": args.patch_size,
+        "model-dim": args.model_dim,
+        "resnet-channels": args.resnet_channels,
+        "heads": args.heads,
+        "state-dim": args.state_dim,
+    }
+    invalid = [name for name, value in positive.items() if value < 1]
+    if invalid:
+        raise ValueError(f"these options must be positive: {', '.join(invalid)}")
+    if args.learning_rate <= 0 or args.weight_decay < 0:
+        raise ValueError("learning-rate must be positive and weight-decay cannot be negative")
+    if args.model in {"vit", "mamba"} and args.image_size % args.patch_size:
+        raise ValueError("image-size must be divisible by patch-size for ViT and Mamba")
+    if args.model == "vit" and args.model_dim % args.heads:
+        raise ValueError("model-dim must be divisible by heads for ViT")
+
+
+def load_checkpoint(path, device):
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint does not exist: {path}")
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    required = {
+        "model_state",
+        "optimizer_state",
+        "epoch",
+        "model_name",
+        "model_kwargs",
+        "image_size",
+        "class_to_idx",
+    }
+    if not isinstance(checkpoint, dict) or not required.issubset(checkpoint):
+        missing = required.difference(checkpoint if isinstance(checkpoint, dict) else ())
+        raise ValueError(
+            "checkpoint is not in the resumable project format; "
+            f"missing fields: {', '.join(sorted(missing))}"
+        )
+    return checkpoint
 
 
 def train_one_epoch(dataloader, model, loss_fn, optimizer, device):
@@ -142,8 +188,7 @@ def save_checkpoint(path, model, optimizer, epoch, args, class_to_idx):
 
 def main(argv=None):
     args = parse_args(argv)
-    if args.epochs < 1 or args.batch_size < 1 or args.depth < 1:
-        raise ValueError("epochs, batch-size, and depth must be positive")
+    validate_args(args)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
@@ -178,7 +223,7 @@ def main(argv=None):
     start_epoch = 0
 
     if args.resume:
-        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        checkpoint = load_checkpoint(args.checkpoint, device)
         if checkpoint["model_name"] != args.model:
             raise ValueError(
                 f"checkpoint uses {checkpoint['model_name']!r}, not requested {args.model!r}"
@@ -187,10 +232,18 @@ def main(argv=None):
             raise ValueError("checkpoint classes do not match the training dataset")
         if checkpoint["model_kwargs"] != model_kwargs(args):
             raise ValueError("checkpoint model settings do not match the supplied arguments")
+        if checkpoint["image_size"] != args.image_size:
+            raise ValueError("checkpoint image size does not match --image-size")
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = args.learning_rate
+            parameter_group["weight_decay"] = args.weight_decay
         start_epoch = checkpoint["epoch"]
         print(f"Resumed from epoch {start_epoch}")
+        if start_epoch >= args.epochs:
+            print(f"Checkpoint already completed {start_epoch} epochs; nothing to train")
+            return
 
     for epoch in range(start_epoch, args.epochs):
         train_loss = train_one_epoch(train_loader, model, loss_fn, optimizer, device)

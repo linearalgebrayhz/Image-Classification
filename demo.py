@@ -6,11 +6,11 @@ import torch
 from PIL import Image
 
 from models import build_model
-from trainer import create_transforms, resolve_device
+from trainer import create_transforms, load_checkpoint, resolve_device
 
 
 def load_predictor(checkpoint_path, device):
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint = load_checkpoint(checkpoint_path, device)
     class_to_idx = checkpoint["class_to_idx"]
     idx_to_class = {index: name for name, index in class_to_idx.items()}
     model = build_model(
@@ -30,9 +30,10 @@ def load_predictor(checkpoint_path, device):
         tensor = transform(image.convert("RGB")).unsqueeze(0).to(device)
         with torch.inference_mode():
             probabilities = model(tensor).softmax(dim=1)[0].cpu()
+        values, indices = probabilities.topk(min(5, probabilities.numel()))
         return {
-            idx_to_class[index]: float(probability)
-            for index, probability in enumerate(probabilities)
+            idx_to_class[index.item()]: float(probability)
+            for probability, index in zip(values, indices)
         }
 
     return predict
