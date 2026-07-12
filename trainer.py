@@ -1,142 +1,216 @@
 import argparse
+import random
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
-
-import numpy as np
-import matplotlib.pyplot as plt
-
 from tqdm import tqdm
 
-from models import *
+from models import build_model
 from utils.data_processing import FruitImageDataset
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"current device is {device}")
 
-parser = argparse.ArgumentParser(
-    prog='trainer.py',
-    description="training classification model",
-    epilog=""
-)
+NORMALIZE_MEAN = [0.485, 0.456, 0.406]
+NORMALIZE_STD = [0.229, 0.224, 0.225]
 
-train_transform = transforms.Compose([
-    transforms.RandomResizedCrop(224),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                         std=[0.229, 0.224, 0.225])
-])
 
-test_transform = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                         std=[0.229, 0.224, 0.225])
-])
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Train an image classifier on Fruits-360")
+    parser.add_argument("--data-root", type=Path, required=True, help="directory containing Training/ and Test/")
+    parser.add_argument("--model", choices=("resnet", "vit", "mamba"), default="resnet")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--patch-size", type=int, default=16)
+    parser.add_argument("--depth", type=int, default=4, help="blocks/layers in the selected model")
+    parser.add_argument("--model-dim", type=int, default=192)
+    parser.add_argument("--heads", type=int, default=8, help="attention heads for ViT")
+    parser.add_argument("--state-dim", type=int, default=16, help="state size for Mamba")
+    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/model.pt"))
+    parser.add_argument("--resume", action="store_true", help="resume model and optimizer from --checkpoint")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args(argv)
 
-train_dataset = FruitImageDataset(
-    root_dir="/scratch/network/hy4522/DL_data/fruits-360_100x100/fruits-360/Training", 
-    transform=train_transform
-)
 
-test_dataset = FruitImageDataset(
-    root_dir="/scratch/network/hy4522/DL_data/fruits-360_100x100/fruits-360/Test",
-    transform=test_transform
-)
+def resolve_device(requested):
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    device = torch.device(requested)
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested but is not available")
+    return device
 
-class_mapping = train_dataset.get_class_mapping()
 
-num_classes = len(class_mapping)
-batch_size = 32
-train_loader = DataLoader(
-    train_dataset,
-    batch_size = batch_size,
-    shuffle = True,
-    num_workers=0
-)
+def create_transforms(image_size):
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(image_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD),
+        ]
+    )
+    test_transform = transforms.Compose(
+        [
+            transforms.Resize(round(image_size * 256 / 224)),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD),
+        ]
+    )
+    return train_transform, test_transform
 
-test_loader = DataLoader(
-    test_dataset,
-    batch_size=batch_size,
-    shuffle = False,
-    num_workers=0   
-)
 
-resume = False
+def model_kwargs(args):
+    if args.model == "resnet":
+        return {"num_blocks": args.depth, "base_channels": args.model_dim}
+    if args.model == "vit":
+        return {
+            "image_size": args.image_size,
+            "patch_size": args.patch_size,
+            "dim": args.model_dim,
+            "depth": args.depth,
+            "heads": args.heads,
+            "mlp_dim": args.model_dim * 2,
+        }
+    return {
+        "image_size": args.image_size,
+        "patch_size": args.patch_size,
+        "dim": args.model_dim,
+        "depth": args.depth,
+        "state_dim": args.state_dim,
+    }
 
-#TODO: change to args.resume, set hyper parameter for model structure
 
-model = ResNet(3, num_classes=num_classes).to(device)
-if resume:
-    model.load_state_dict(torch.load("./checkpoints/model.pth", weights_only=True))
-
-loss_fn = nn.CrossEntropyLoss()
-optimizer = torch.optim.SGD(model.parameters(), lr = 1e-3)
-
-def train(dataloader, batch_size, model, loss_fn, optimizer):
-    size = len(dataloader.dataset)
+def train_one_epoch(dataloader, model, loss_fn, optimizer, device):
+    """Train for one epoch and return mean sample loss."""
     model.train()
-    for batch, (X, y) in tqdm(enumerate(dataloader), total = size//batch_size, desc="Training classification"):
-        X, y = X.to(device), y.to(device)
-        
-        pred = model(X)
-        # pred = F.softmax(pred) no need!
-        loss = loss_fn(pred, y)
-        
+    total_loss = 0.0
+    for images, labels in tqdm(dataloader, desc="Training", leave=False):
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images)
+        loss = loss_fn(logits, labels)
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
-        
-        if batch % 100 == 0:
-            loss, current = loss.item(), (batch + 1) * len(X)
-            print(f"\ntraining loss: {loss:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
-            
-"""
-side notes:
-Output from model `num_classes` entries tensor is called logits (not yet normalized)
-However, no softmax function is needed during training.
-In `nn.CrossEntropyLoss()`, several steps are implemented
-1. Logits -> softmax -> probability distribution
-2. cross entropy calculation
-"""      
+        total_loss += loss.item() * labels.size(0)
+    return total_loss / len(dataloader.dataset)
 
-def evaluate(dataloader, batch_size, model):
+
+def evaluate(dataloader, model, loss_fn, device):
+    """Return mean loss and accuracy for a data loader."""
     model.eval()
     correct = 0
-    total = 0
+    total_loss = 0.0
+    with torch.inference_mode():
+        for images, labels in tqdm(dataloader, desc="Evaluating", leave=False):
+            images, labels = images.to(device), labels.to(device)
+            logits = model(images)
+            total_loss += loss_fn(logits, labels).item() * labels.size(0)
+            correct += (logits.argmax(dim=1) == labels).sum().item()
     size = len(dataloader.dataset)
-    
-    with torch.no_grad():
-        for inputs, labels in tqdm(dataloader, total = size//batch_size ,desc="Testing"):
-            inputs, labels = inputs.to(device), labels.to(device)
-            
-            pred = model(inputs)
-            _, predicted = torch.max(pred, 1)
-            
-            correct += (predicted == labels).sum().item()
-            total += labels.size(0)
-    accuracy = correct/total
-    return accuracy
-            
-epochs = 3
-for t in range(epochs):
-    print(f"Epoch {t+1}\n-------------------------------")
-    train(train_loader,batch_size, model, loss_fn, optimizer)
-    accuracy = evaluate(test_loader, batch_size, model)
-    print(f"Epoch {t+1} ends, evaluation accuracy on test set is: {accuracy:2f}")
+    return total_loss / size, correct / size
 
-torch.save(model.state_dict(), "./checkpoints/model.pth")
-print("Saved PyTorch Model State to model.pth")
 
-model.eval()
-X, y = test_dataset[0][0], test_dataset[0][1]
-with torch.no_grad():
-    X = X.to(device)
-    pred = model(X)
-    predicted, actual = class_mapping[torch.argmax(pred[0])], class_mapping[y]
-    print(f'Predicted: "{predicted}", Actual: "{actual}"')
-    
+def save_checkpoint(path, model, optimizer, epoch, args, class_to_idx):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "epoch": epoch,
+            "model_name": args.model,
+            "model_kwargs": model_kwargs(args),
+            "image_size": args.image_size,
+            "class_to_idx": class_to_idx,
+        },
+        path,
+    )
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.epochs < 1 or args.batch_size < 1 or args.depth < 1:
+        raise ValueError("epochs, batch-size, and depth must be positive")
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = resolve_device(args.device)
+    print(f"Using device: {device}")
+
+    train_transform, test_transform = create_transforms(args.image_size)
+    train_dataset = FruitImageDataset(args.data_root / "Training", train_transform)
+    test_dataset = FruitImageDataset(
+        args.data_root / "Test",
+        test_transform,
+        class_to_idx=train_dataset.class_to_idx,
+    )
+    loader_options = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_options)
+    test_loader = DataLoader(test_dataset, shuffle=False, **loader_options)
+
+    model = build_model(
+        args.model,
+        num_classes=len(train_dataset.class_to_idx),
+        **model_kwargs(args),
+    ).to(device)
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    start_epoch = 0
+
+    if args.resume:
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        if checkpoint["model_name"] != args.model:
+            raise ValueError(
+                f"checkpoint uses {checkpoint['model_name']!r}, not requested {args.model!r}"
+            )
+        if checkpoint["class_to_idx"] != train_dataset.class_to_idx:
+            raise ValueError("checkpoint classes do not match the training dataset")
+        if checkpoint["model_kwargs"] != model_kwargs(args):
+            raise ValueError("checkpoint model settings do not match the supplied arguments")
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        start_epoch = checkpoint["epoch"]
+        print(f"Resumed from epoch {start_epoch}")
+
+    for epoch in range(start_epoch, args.epochs):
+        train_loss = train_one_epoch(train_loader, model, loss_fn, optimizer, device)
+        test_loss, accuracy = evaluate(test_loader, model, loss_fn, device)
+        save_checkpoint(
+            args.checkpoint,
+            model,
+            optimizer,
+            epoch + 1,
+            args,
+            train_dataset.class_to_idx,
+        )
+        print(
+            f"Epoch {epoch + 1}/{args.epochs}: "
+            f"train loss {train_loss:.4f}, test loss {test_loss:.4f}, "
+            f"accuracy {accuracy:.2%}"
+        )
+
+    print(f"Saved checkpoint to {args.checkpoint}")
+
+
+if __name__ == "__main__":
+    main()
